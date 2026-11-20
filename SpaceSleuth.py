@@ -6,15 +6,87 @@ A kiválasztott elemek törlése végleges. A program a törléshez nem használ
 külső parancsot és nem követ szimbolikus hivatkozásokat a vizsgálatkor.
 """
 
+import csv
+import heapq
 import os
 import queue
 import shutil
 import threading
 import tkinter as tk
+import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from lemezterulet_elemzo import TOP_COUNT, human_size, scan, write_csv
+# A program akkor is önállóan működik, ha csak ezt az egy .py fájlt másolod át.
+# Ha a terminálos segédfájl mellette van, azt használja; egyébként az alábbi
+# beépített változat látja el ugyanazt a feladatot.
+try:
+    from lemezterulet_elemzo import TOP_COUNT, human_size, scan, write_csv
+except ModuleNotFoundError:
+    TOP_COUNT = 30
+
+    def human_size(size: int) -> str:
+        units = ("B", "KB", "MB", "GB", "TB", "PB")
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024
+        return f"{size} B"
+
+    def _keep_largest(heap, size: int, path: str) -> None:
+        record = (size, path)
+        if len(heap) < TOP_COUNT:
+            heapq.heappush(heap, record)
+        elif record > heap[0]:
+            heapq.heapreplace(heap, record)
+
+    def scan(root: Path, progress=None):
+        file_heap, dir_heap = [], []
+        stats = {"files": 0, "dirs": 0, "errors": 0}
+        sizes, stack = {}, [(root, None, True)]
+        last_progress = 0.0
+        while stack:
+            path, parent, entering = stack.pop()
+            now = time.monotonic()
+            if progress and now - last_progress >= 0.35:
+                progress(stats.copy())
+                last_progress = now
+            if not entering:
+                size = sizes.get(path, 0)
+                if parent is not None:
+                    sizes[parent] = sizes.get(parent, 0) + size
+                _keep_largest(dir_heap, size, str(path))
+                continue
+            sizes[path] = 0
+            stats["dirs"] += 1
+            stack.append((path, parent, False))
+            try:
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append((Path(entry.path), path, True))
+                            else:
+                                size = entry.stat(follow_symlinks=False).st_size
+                                stats["files"] += 1
+                                sizes[path] += size
+                                _keep_largest(file_heap, size, entry.path)
+                        except (OSError, PermissionError):
+                            stats["errors"] += 1
+            except (OSError, PermissionError):
+                stats["errors"] += 1
+        return sorted(file_heap, reverse=True), sorted(dir_heap, reverse=True), stats
+
+    def write_csv(filename: Path, files, directories) -> None:
+        with filename.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("Típus", "Helyezés", "Méret (bájt)", "Méret", "Elérési út"))
+            for kind, rows in (("Fájl", files), ("Mappa", directories)):
+                for rank, (size, path) in enumerate(rows, 1):
+                    writer.writerow((kind, rank, size, human_size(size), path))
 
 
 class DiskAnalyzerApp(tk.Tk):
