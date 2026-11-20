@@ -11,6 +11,7 @@ import heapq
 import os
 import queue
 import shutil
+import subprocess
 import threading
 import tkinter as tk
 import time
@@ -24,6 +25,8 @@ try:
     from lemezterulet_elemzo import TOP_COUNT, human_size, scan, write_csv
 except ModuleNotFoundError:
     TOP_COUNT = 30
+    RECYCLE_BIN_NAMES = {"$recycle.bin", "recycler"}
+    PROGRESS_INTERVAL_SECONDS = 2.0
 
     def human_size(size: int) -> str:
         units = ("B", "KB", "MB", "GB", "TB", "PB")
@@ -49,7 +52,7 @@ except ModuleNotFoundError:
         while stack:
             path, parent, entering = stack.pop()
             now = time.monotonic()
-            if progress and now - last_progress >= 0.35:
+            if progress and now - last_progress >= PROGRESS_INTERVAL_SECONDS:
                 progress(stats.copy())
                 last_progress = now
             if not entering:
@@ -65,6 +68,8 @@ except ModuleNotFoundError:
                 with os.scandir(path) as entries:
                     for entry in entries:
                         try:
+                            if entry.name.casefold() in RECYCLE_BIN_NAMES:
+                                continue
                             if entry.is_symlink():
                                 continue
                             if entry.is_dir(follow_symlinks=False):
@@ -96,6 +101,7 @@ class DiskAnalyzerApp(tk.Tk):
         self.minsize(900, 580)
         self.path = tk.StringVar(value=str(Path.home()))
         self.status = tk.StringVar(value="Válassz egy mappát, majd indítsd a vizsgálatot.")
+        self.scan_note = tk.StringVar(value="")
         self.root_path = None
         self.files, self.directories = [], []
         self.events = queue.Queue()
@@ -112,9 +118,10 @@ class DiskAnalyzerApp(tk.Tk):
         self.scan_button.grid(row=1, column=2, padx=(8, 0), pady=(3, 0))
         top.columnconfigure(0, weight=1)
 
-        self.progress = ttk.Progressbar(self, mode="indeterminate")
-        self.progress.pack(fill="x", padx=12)
-        ttk.Label(self, textvariable=self.status, padding=(12, 5)).pack(fill="x")
+        status_card = ttk.Frame(self, padding=(12, 7))
+        status_card.pack(fill="x")
+        ttk.Label(status_card, textvariable=self.scan_note, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(status_card, textvariable=self.status).pack(anchor="w", pady=(2, 0))
 
         content = ttk.Panedwindow(self, orient="horizontal")
         content.pack(fill="both", expand=True, padx=12, pady=(0, 8))
@@ -138,6 +145,7 @@ class DiskAnalyzerApp(tk.Tk):
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side="left", fill="both", expand=True)
+        tree.bind("<Double-1>", self.open_item)
         scrollbar.pack(side="right", fill="y")
         parent.add(frame, weight=1)
         return tree
@@ -155,8 +163,8 @@ class DiskAnalyzerApp(tk.Tk):
         self.root_path = root.resolve()
         self._clear_trees()
         self.scan_button.configure(state="disabled")
-        self.progress.start(12)
-        self.status.set("Vizsgálat folyamatban…")
+        self.scan_note.set("◌  Vizsgálat folyamatban — nyugodtan fut a háttérben")
+        self.status.set("A mappák feltérképezése elkezdődött…")
         threading.Thread(target=self._scan_worker, args=(root,), daemon=True).start()
 
     def _scan_worker(self, root):
@@ -176,12 +184,12 @@ class DiskAnalyzerApp(tk.Tk):
                 elif event[0] == "complete":
                     self.files, self.directories, stats = event[1:]
                     self._show_results()
-                    self.progress.stop()
                     self.scan_button.configure(state="normal")
+                    self.scan_note.set("✓  Vizsgálat befejezve")
                     self.status.set(f"Kész: {stats['files']:,} fájl, {stats['dirs']:,} mappa, {stats['errors']:,} kihagyva.")
                 else:
-                    self.progress.stop()
                     self.scan_button.configure(state="normal")
+                    self.scan_note.set("!  A vizsgálat megszakadt")
                     self.status.set("A vizsgálat nem fejeződött be.")
                     messagebox.showerror("Vizsgálati hiba", event[1])
         except queue.Empty:
@@ -216,6 +224,24 @@ class DiskAnalyzerApp(tk.Tk):
             if not contained and path not in result:
                 result.append(path)
         return result
+
+    def open_item(self, event):
+        """Fájlnál az Intézőben megmutatja a helyét, mappánál megnyitja azt."""
+        tree = event.widget
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        path = Path(tree.item(item, "values")[1])
+        if not path.exists():
+            messagebox.showwarning("Az elem már nem található", str(path))
+            return
+        try:
+            if path.is_dir():
+                os.startfile(str(path))
+            else:
+                subprocess.Popen(["explorer.exe", f"/select,{path}"])
+        except OSError as error:
+            messagebox.showerror("Nem nyitható meg", str(error))
 
     def delete_selected(self):
         paths = self._selected_paths()
