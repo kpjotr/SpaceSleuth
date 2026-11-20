@@ -7,6 +7,7 @@ külső parancsot és nem követ szimbolikus hivatkozásokat a vizsgálatkor.
 """
 
 import csv
+import ctypes
 import heapq
 import os
 import queue
@@ -26,6 +27,8 @@ try:
 except ModuleNotFoundError:
     TOP_COUNT = 30
     RECYCLE_BIN_NAMES = {"$recycle.bin", "recycler"}
+    SYSTEM_ROOT_FILES = {"hiberfil.sys", "pagefile.sys", "swapfile.sys", "bootmgr", "bootnxt", "bootsect.bak"}
+    SYSTEM_PROTECTED_DIRS = {"system volume information", "recovery", "$winreagent", "$sysreset"}
     PROGRESS_INTERVAL_SECONDS = 2.0
 
     def human_size(size: int) -> str:
@@ -70,6 +73,10 @@ except ModuleNotFoundError:
                         try:
                             if entry.name.casefold() in RECYCLE_BIN_NAMES:
                                 continue
+                            if entry.name.casefold() in SYSTEM_PROTECTED_DIRS:
+                                continue
+                            if Path(entry.path).parent == Path(Path(entry.path).anchor) and entry.name.casefold() in SYSTEM_ROOT_FILES:
+                                continue
                             if entry.is_symlink():
                                 continue
                             if entry.is_dir(follow_symlinks=False):
@@ -94,12 +101,51 @@ except ModuleNotFoundError:
                     writer.writerow((kind, rank, size, human_size(size), path))
 
 
+class ScanOrb(tk.Canvas):
+    """Lassan mozgó, kis méretű „radar” állapotjelző."""
+    def __init__(self, parent):
+        super().__init__(parent, width=38, height=38, highlightthickness=0, bg="#f4f7f8")
+        self.step, self.running = 0, False
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        self.create_oval(5, 5, 33, 33, outline="#bfd2d8", width=1)
+        self.create_oval(14, 14, 24, 24, fill="#f4f7f8", outline="#bfd2d8")
+        dots = ((19, 5), (29, 9), (33, 19), (29, 29), (19, 33), (9, 29), (5, 19), (9, 9))
+        for index, (x, y) in enumerate(dots):
+            offset = (index - self.step) % len(dots)
+            color = "#23849a" if offset == 0 else ("#8bbbc6" if offset == 1 else "#d8e5e8")
+            radius = 3 if offset == 0 else 2
+            self.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline="")
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._tick()
+
+    def stop(self, completed=False):
+        self.running = False
+        self.delete("all")
+        color = "#398a58" if completed else "#97a8ad"
+        self.create_oval(5, 5, 33, 33, outline=color, width=1)
+        self.create_text(19, 19, text="✓" if completed else "", fill=color, font=("Segoe UI", 13, "bold"))
+
+    def _tick(self):
+        if not self.running:
+            return
+        self.step = (self.step + 1) % 8
+        self.draw()
+        self.after(550, self._tick)
+
+
 class DiskAnalyzerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Lemezterület-elemző")
         self.minsize(900, 580)
-        self.path = tk.StringVar(value=str(Path.home()))
+        self.path = tk.StringVar(value="C:\\")
         self.status = tk.StringVar(value="Válassz egy mappát, majd indítsd a vizsgálatot.")
         self.scan_note = tk.StringVar(value="")
         self.root_path = None
@@ -116,12 +162,18 @@ class DiskAnalyzerApp(tk.Tk):
         ttk.Button(top, text="Tallózás…", command=self.choose_folder).grid(row=1, column=1, pady=(3, 0))
         self.scan_button = ttk.Button(top, text="Vizsgálat indítása", command=self.start_scan)
         self.scan_button.grid(row=1, column=2, padx=(8, 0), pady=(3, 0))
+        ttk.Button(top, text="Rendszertisztítás…", command=self.open_cleanup).grid(row=1, column=3, padx=(8, 0), pady=(3, 0))
+        ttk.Button(top, text="ⓘ Információ", command=self.show_info).grid(row=1, column=4, padx=(8, 0), pady=(3, 0))
         top.columnconfigure(0, weight=1)
 
         status_card = ttk.Frame(self, padding=(12, 7))
         status_card.pack(fill="x")
-        ttk.Label(status_card, textvariable=self.scan_note, font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(status_card, textvariable=self.status).pack(anchor="w", pady=(2, 0))
+        self.orb = ScanOrb(status_card)
+        self.orb.pack(side="left", padx=(0, 9))
+        status_words = ttk.Frame(status_card)
+        status_words.pack(side="left", fill="x", expand=True)
+        ttk.Label(status_words, textvariable=self.scan_note, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(status_words, textvariable=self.status).pack(anchor="w", pady=(2, 0))
 
         content = ttk.Panedwindow(self, orient="horizontal")
         content.pack(fill="both", expand=True, padx=12, pady=(0, 8))
@@ -130,7 +182,7 @@ class DiskAnalyzerApp(tk.Tk):
 
         bottom = ttk.Frame(self, padding=(12, 0, 12, 12))
         bottom.pack(fill="x")
-        ttk.Label(bottom, text="Több sort is kijelölhetsz Ctrl vagy Shift használatával.").pack(side="left")
+        ttk.Label(bottom, text="Kattintás: kijelölés / kijelölés megszüntetése. Ctrl és Shift is használható.").pack(side="left")
         ttk.Button(bottom, text="CSV exportálása…", command=self.export_csv).pack(side="right")
         self.delete_button = ttk.Button(bottom, text="Kijelöltek végleges törlése…", command=self.delete_selected)
         self.delete_button.pack(side="right", padx=(0, 8))
@@ -145,6 +197,7 @@ class DiskAnalyzerApp(tk.Tk):
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side="left", fill="both", expand=True)
+        tree.bind("<Button-1>", self.toggle_item)
         tree.bind("<Double-1>", self.open_item)
         scrollbar.pack(side="right", fill="y")
         parent.add(frame, weight=1)
@@ -163,8 +216,9 @@ class DiskAnalyzerApp(tk.Tk):
         self.root_path = root.resolve()
         self._clear_trees()
         self.scan_button.configure(state="disabled")
-        self.scan_note.set("◌  Vizsgálat folyamatban — nyugodtan fut a háttérben")
+        self.scan_note.set("Vizsgálat folyamatban")
         self.status.set("A mappák feltérképezése elkezdődött…")
+        self.orb.start()
         threading.Thread(target=self._scan_worker, args=(root,), daemon=True).start()
 
     def _scan_worker(self, root):
@@ -185,10 +239,12 @@ class DiskAnalyzerApp(tk.Tk):
                     self.files, self.directories, stats = event[1:]
                     self._show_results()
                     self.scan_button.configure(state="normal")
+                    self.orb.stop(completed=True)
                     self.scan_note.set("✓  Vizsgálat befejezve")
                     self.status.set(f"Kész: {stats['files']:,} fájl, {stats['dirs']:,} mappa, {stats['errors']:,} kihagyva.")
                 else:
                     self.scan_button.configure(state="normal")
+                    self.orb.stop()
                     self.scan_note.set("!  A vizsgálat megszakadt")
                     self.status.set("A vizsgálat nem fejeződött be.")
                     messagebox.showerror("Vizsgálati hiba", event[1])
@@ -224,6 +280,41 @@ class DiskAnalyzerApp(tk.Tk):
             if not contained and path not in result:
                 result.append(path)
         return result
+
+    def toggle_item(self, event):
+        """Egy kattintással kapcsolható minden sor, módosító billentyű nélkül is."""
+        tree = event.widget
+        item = tree.identify_row(event.y)
+        if not item:
+            return None
+        if item in tree.selection():
+            tree.selection_remove(item)
+        else:
+            tree.selection_add(item)
+        return "break"
+
+    def show_info(self):
+        window = tk.Toplevel(self)
+        window.title("SpaceSleuth – Információ")
+        window.transient(self)
+        window.grab_set()
+        window.resizable(False, False)
+        body = (
+            "SpaceSleuth\n\n"
+            "A program megkeresi a legtöbb helyet foglaló fájlokat és mappákat. "
+            "A vizsgálat csak olvasási műveleteket végez; a Lomtár, valamint a "
+            "rendszerindításhoz és memóriakezeléshez szükséges kritikus elemek ki vannak zárva.\n\n"
+            "Kattintásra a lista egy sora kijelölődik vagy megszűnik a kijelölése. "
+            "Dupla kattintás fájlnál megnyitja a helyét az Intézőben, mappánál pedig magát a mappát.\n\n"
+            "A Rendszertisztítás csak ideiglenes, újraépíthető adatkategóriákat kínál fel. "
+            "A törlések véglegesek, ezért a jóváhagyó ablakban mindig ellenőrizd a választásodat."
+        )
+        ttk.Label(window, text=body, justify="left", wraplength=490, padding=18).pack()
+        ttk.Button(window, text="Bezárás", command=window.destroy).pack(pady=(0, 16))
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+
+    def open_cleanup(self):
+        CleanupWindow(self)
 
     def open_item(self, event):
         """Fájlnál az Intézőben megmutatja a helyét, mappánál megnyitja azt."""
@@ -290,6 +381,229 @@ class DiskAnalyzerApp(tk.Tk):
                 self.status.set(f"CSV elkészült: {filename}")
             except OSError as error:
                 messagebox.showerror("Exportálási hiba", str(error))
+
+
+class CleanupWindow(tk.Toplevel):
+    """Óvatos, kategóriaalapú tisztítás elkülönített, modális ablakban."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("SpaceSleuth – Rendszertisztítás")
+        self.geometry("940x510")
+        self.minsize(820, 430)
+        self.transient(parent)
+        self.grab_set()
+        self.events = queue.Queue()
+        self.rows = {}
+        self.status = tk.StringVar(value="A tisztítható kategóriák méretének felmérése indul…")
+        self.note = tk.StringVar(value="Tisztítható adatok felmérése")
+        self._build()
+        self.after(150, self._drain_events)
+        self.start_scan()
+
+    @staticmethod
+    def categories():
+        local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        temp = Path(os.environ.get("TEMP", local / "Temp"))
+        windows = Path(os.environ.get("SystemRoot", r"C:\\Windows"))
+        program_data = Path(os.environ.get("ProgramData", r"C:\\ProgramData"))
+        return [
+            ("Felhasználói ideiglenes fájlok", "Programok átmeneti fájljai.", [temp]),
+            ("Windows ideiglenes fájlok", "A Windows által hátrahagyott átmeneti adatok.", [windows / "Temp"]),
+            ("DirectX shader cache", "Újraépíthető grafikus gyorsítótár.", [local / "D3DSCache"]),
+            ("Windows hibajelentések (felhasználó)", "Elküldetlen vagy archivált hibajelentések.", [local / "Microsoft" / "Windows" / "WER"]),
+            ("Windows hibajelentések (rendszer)", "Rendszerszintű hibajelentési adatok.", [program_data / "Microsoft" / "Windows" / "WER"]),
+            ("Windows Update letöltési gyorsítótár", "Újra letölthető frissítési csomagok.", [windows / "SoftwareDistribution" / "Download"]),
+            ("Lomtár tartalma", "A korábban törölt, de még a Lomtárban lévő elemek.", [Path(r"C:\\$Recycle.Bin")]),
+        ]
+
+    def _build(self):
+        top = ttk.Frame(self, padding=12)
+        top.pack(fill="x")
+        self.orb = ScanOrb(top)
+        self.orb.pack(side="left", padx=(0, 9))
+        text = ttk.Frame(top)
+        text.pack(side="left", fill="x", expand=True)
+        ttk.Label(text, textvariable=self.note, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(text, textvariable=self.status).pack(anchor="w", pady=(2, 0))
+
+        frame = ttk.Frame(self, padding=(12, 0, 12, 8))
+        frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(frame, columns=("size", "location", "description"), show="headings", selectmode="extended")
+        for key, title, width in (("size", "Méret", 105), ("location", "Hely", 320), ("description", "Tartalom", 360)):
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, stretch=key != "size", anchor="e" if key == "size" else "w")
+        bar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=bar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        self.tree.bind("<Button-1>", self.toggle_item)
+
+        bottom = ttk.Frame(self, padding=(12, 0, 12, 12))
+        bottom.pack(fill="x")
+        ttk.Label(bottom, text="Kattintással jelöld ki vagy vedd ki a kategóriát.").pack(side="left")
+        self.clean_button = ttk.Button(bottom, text="Kijelölt kategóriák végleges tisztítása…", command=self.clean_selected)
+        self.clean_button.pack(side="right")
+        self.refresh_button = ttk.Button(bottom, text="Újramérés", command=self.start_scan)
+        self.refresh_button.pack(side="right", padx=(0, 8))
+        ttk.Button(bottom, text="Bezárás", command=self.destroy).pack(side="right", padx=(0, 8))
+
+    def toggle_item(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return None
+        if item in self.tree.selection():
+            self.tree.selection_remove(item)
+        else:
+            self.tree.selection_add(item)
+        return "break"
+
+    def start_scan(self):
+        self.tree.delete(*self.tree.get_children())
+        self.rows = {}
+        self.note.set("Tisztítható adatok felmérése")
+        self.status.set("A kategóriák átvizsgálása folyamatban…")
+        self.orb.start()
+        self.clean_button.configure(state="disabled")
+        self.refresh_button.configure(state="disabled")
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        results, errors = [], 0
+        for name, description, roots in self.categories():
+            size, skipped = self._size_of(roots)
+            errors += skipped
+            results.append((name, description, roots, size))
+        self.events.put(("scanned", results, errors))
+
+    @staticmethod
+    def _size_of(roots):
+        total, skipped = 0, 0
+        stack = [path for path in roots if path.exists()]
+        while stack:
+            path = stack.pop()
+            try:
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            else:
+                                total += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            skipped += 1
+            except OSError:
+                skipped += 1
+        return total, skipped
+
+    def clean_selected(self):
+        chosen = [self.rows[item] for item in self.tree.selection()]
+        if not chosen:
+            messagebox.showinfo("Nincs kijelölés", "Jelölj ki legalább egy tisztítási kategóriát.", parent=self)
+            return
+        names = "\n".join(f"• {row[0]} ({human_size(row[3])})" for row in chosen)
+        if not messagebox.askyesno(
+            "Végleges tisztítás megerősítése",
+            "Az alábbi kategóriák tartalma végleg törlődik, nem kerül a Lomtárba:\n\n" + names + "\n\nFolytatod?",
+            icon="warning", parent=self,
+        ):
+            return
+        self.note.set("Tisztítás folyamatban")
+        self.status.set("A kijelölt, nélkülözhető adatok eltávolítása folyamatban…")
+        self.orb.start()
+        self.clean_button.configure(state="disabled")
+        threading.Thread(target=self._clean_worker, args=(chosen,), daemon=True).start()
+
+    def _clean_worker(self, chosen):
+        removed, failures = 0, []
+        for name, _, roots, size in chosen:
+            # A $Recycle.Bin más Windows-fiókok védett SID-mappáit is tartalmazza.
+            # Ezeket nem fájlonként próbáljuk törölni: a Windows saját API-ja csak
+            # az aktuális felhasználó Lomtárát üríti, jogosultsági hibalista nélkül.
+            if name == "Lomtár tartalma":
+                error = self._empty_recycle_bin()
+                if error:
+                    failures.append(f"Lomtár: {error}")
+                else:
+                    removed += size
+                continue
+            for root in roots:
+                if not root.is_dir():
+                    continue
+                try:
+                    with os.scandir(root) as entries:
+                        for entry in entries:
+                            path = Path(entry.path)
+                            try:
+                                if entry.is_dir(follow_symlinks=False) and not entry.is_symlink():
+                                    shutil.rmtree(path)
+                                else:
+                                    path.unlink()
+                            except OSError as error:
+                                failures.append(f"{name}: {path.name} ({error})")
+                    removed += size
+                except OSError as error:
+                    failures.append(f"{name}: {root} ({error})")
+        self.events.put(("cleaned", removed, failures))
+
+    @staticmethod
+    def _empty_recycle_bin():
+        """Az aktuális felhasználó C: meghajtón lévő Lomtárát üríti a Windows API-val."""
+        # SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND
+        flags = 0x00000001 | 0x00000002 | 0x00000004
+        try:
+            result = ctypes.windll.shell32.SHEmptyRecycleBinW(None, "C:\\", flags)
+        except (AttributeError, OSError) as error:
+            return str(error)
+        if result != 0:
+            return f"A Windows nem tudta kiüríteni a Lomtárat (hibakód: {result})."
+        return None
+
+    def _drain_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                if event[0] == "scanned":
+                    results, errors = event[1:]
+                    visible_results = [row for row in results if row[3] > 0]
+                    for index, row in enumerate(visible_results):
+                        name, description, roots, size = row
+                        location = "; ".join(str(root) for root in roots)
+                        item = f"category-{index}"
+                        self.rows[item] = row
+                        self.tree.insert("", "end", iid=item, values=(human_size(size), location, description))
+                    self.orb.stop(completed=True)
+                    self.note.set("✓  Tisztítható adatok felmérve")
+                    if visible_results:
+                        self.status.set(f"{len(visible_results)} tisztítható kategória készen áll a kijelölésre. {errors:,} nem olvasható elem kimaradt.")
+                    else:
+                        self.status.set("Jelenleg nincs mérhető, tisztítható kategória. 0 B méretű sorok nem jelennek meg.")
+                    self.clean_button.configure(state="normal")
+                    self.refresh_button.configure(state="normal")
+                elif event[0] == "cleaned":
+                    removed, failures = event[1:]
+                    self.orb.stop(completed=True)
+                    self.note.set("✓  Tisztítás befejezve")
+                    self.status.set(f"Legfeljebb {human_size(removed)} hely felszabadult.")
+                    self.clean_button.configure(state="normal")
+                    self.refresh_button.configure(state="normal")
+                    if failures:
+                        examples = "\n".join(f"• {text}" for text in failures[:3])
+                        more = f"\n… és további {len(failures) - 3} elem." if len(failures) > 3 else ""
+                        messagebox.showwarning(
+                            "Néhány elem használatban van vagy nem törölhető",
+                            f"{len(failures)} elem kimaradt, mert egy program használja vagy nincs hozzá jogosultság. "
+                            "Ez nem akadályozza a többi elem tisztítását.\n\n"
+                            f"Példák:\n{examples}{more}\n\n"
+                            "Zárd be az érintett programokat, majd szükség esetén futtasd újra a tisztítást.",
+                            parent=self,
+                        )
+                    self.start_scan()
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(150, self._drain_events)
 
 
 if __name__ == "__main__":
